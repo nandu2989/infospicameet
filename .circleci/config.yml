@@ -1,0 +1,482 @@
+version: 2.1
+orbs:
+  win: circleci/windows@1.0.0
+  aws-s3: circleci/aws-s3@1.0.11
+  owasp: entur/owasp@0.0.10
+
+executors:
+  wine-chrome:
+    working_directory: ~/mattermost-desktop
+    docker:
+      - image: electronuserland/builder:wine-chrome
+        environment:
+          TAR_OPTIONS: --no-same-owner
+  wine-mono:
+    working_directory: ~/mattermost-desktop
+    docker:
+      - image: electronuserland/builder:wine-mono
+  mac:
+    working_directory: ~/mattermost-desktop
+    macos:
+      xcode: "10.3.0"
+  aws:
+    working_directory: ~/mattermost-desktop
+    docker:
+      - image: 'circleci/python:2.7'
+  github:
+    working_directory: ~/mattermost-desktop
+    docker:
+      - image: circleci/golang:1.12
+commands:
+  notify:
+    description: "notify on release channel"
+    parameters:
+      message:
+        type: string
+        default: "This is the default notification message, someone forgot to add info on what to notify!"
+      username:
+        type: string
+        default: "MattermostRelease"
+      icon:
+        type: string
+        default: "https://www.mattermost.org/wp-content/uploads/2016/04/icon.png"
+    steps:
+      - run: 
+          command: |
+            export VERSION=$(jq -r .version package.json)
+            echo "payload=" > /tmp/webhook-data.json;
+            echo '{}' | jq "{
+              \"username\": \"<< parameters.username >>\",
+              \"icon_url\": \"<< parameters.icon >>\",
+              \"text\": \"[${VERSION}] << parameters.message >>\"
+            }" >> /tmp/webhook-data.json
+      - run:
+          command: |
+            curl -i -X POST -d @/tmp/webhook-data.json $MATTERMOST_RELEASE_WEBHOOK_URL_DESKTOP || echo "NOFICATION FAILED! check logs as this will succeed intentionally"
+
+  update_image:
+    description: "Update base image"
+    parameters:
+      apt_opts:
+        type: string
+        default: ""
+    steps:
+      - run: apt-get update && apt-get -y install << parameters.apt_opts >>
+      - run: npm install
+
+  win_make:
+    description: "Run mattermost's makefile.ps1 on ./scripts/"
+    parameters:
+      operation:
+        type: string
+        default: ""
+    steps:
+      - run:
+          command: ./scripts/Makefile.ps1 << parameters.operation >>
+          name: << parameters.operation >>
+          shell: powershell
+  build:
+    description: "Building << parameters.os >> app"
+    parameters:
+      os:
+        type: string
+        default: "linux"
+      path:
+        type: string
+        default: "./dist/linux"
+      subpath:
+        type: string
+        default: "./linux/"
+    steps:
+      - run: npm run package:<< parameters.os >>
+      - run: mkdir -p << parameters.path >>
+      - run: bash -x ./scripts/cp_artifacts.sh release << parameters.path >>
+      - persist_to_workspace:
+          root: ./dist
+          paths:
+            - "./<< parameters.subpath >>/"
+jobs:
+  check:
+    executor: wine-chrome
+    steps:
+      - checkout
+      - update_image:
+          apt_opts: "--no-install-recommends"
+      - restore_cache:
+          key: lint-{{ arch }}-{{ .Branch }}-{{ checksum "package-lock.json" }}
+      - run: npm run lint:js-quiet
+      - run: ELECTRON_DISABLE_SANDBOX=1 xvfb-run npm run test:app
+      - run: mkdir -p /tmp/test-results
+      - run: cp test-results.xml /tmp/test-results/
+      - store_test_results:
+          path: /tmp/test-results
+      - save_cache:
+          key: lint-{{ arch }}-{{ .Branch }}-{{ checksum "package-lock.json" }}
+          paths:
+            - "node_modules"
+            - "src/node_modules"
+
+  check-deps:
+    parameters:
+      cve_data_directory:
+        type: string
+        default: "~/.owasp/dependency-check-data"
+    working_directory: ~/mattermost/desktop
+    executor: owasp/default
+    environment:
+      version_url: "https://jeremylong.github.io/DependencyCheck/current.txt"
+      executable_url: "https://dl.bintray.com/jeremy-long/owasp/dependency-check-VERSION-release.zip"
+    steps:
+      - checkout
+      - run:
+          name: Link dependency cache
+          command: sudo ln -s ~/mattermost/desktop /root/mattermost-desktop; sudo chmod 777 /root
+      - restore_cache:
+          key: npm-{{ arch }}-{{ .Branch }}-{{ checksum "package-lock.json" }}
+      - restore_cache:
+          key: npm-{{ arch }}-{{ .Branch }}-{{ checksum "src/package-lock.json" }}
+      - run:
+          name: Adjust permissions
+          command: |
+            sudo chown -R `id -nu`:`id -ng` node_modules
+            sudo chown -R `id -nu`:`id -ng` src/node_modules
+      - run:
+          name: Checkout config
+          command: cd .. && git clone https://github.com/mattermost/security-automation-config
+      - run:
+          name: Install Go
+          command: sudo apt-get update && sudo apt-get install golang
+      - owasp/with_commandline:
+          steps:
+            # Taken from https://github.com/entur/owasp-orb/blob/master/src/%40orb.yml#L349-L361
+            - owasp/generate_cache_keys:
+                cache_key: commmandline-default-cache-key-v6
+            - owasp/restore_owasp_cache
+            - run:
+                name: Update OWASP Dependency-Check Database
+                command: ~/.owasp/dependency-check/bin/dependency-check.sh --data << parameters.cve_data_directory >> --updateonly
+            - owasp/store_owasp_cache:
+                cve_data_directory: <<parameters.cve_data_directory>>
+            - run:
+                name: Run OWASP Dependency-Check Analyzer
+                command: |
+                  ~/.owasp/dependency-check/bin/dependency-check.sh \
+                    --data << parameters.cve_data_directory >> --format ALL --noupdate --enableExperimental \
+                    --propertyfile ../security-automation-config/dependency-check/dependencycheck.properties \
+                    --suppression ../security-automation-config/dependency-check/suppression.xml \
+                    --suppression ../security-automation-config/dependency-check/suppression.$CIRCLE_PROJECT_REPONAME.xml \
+                    --scan './**/*' || true
+            - owasp/collect_reports:
+                persist_to_workspace: false
+      - run:
+          name: Post results to Mattermost
+          command: go run ../security-automation-config/dependency-check/post_results.go
+
+  build-linux:
+    executor: wine-mono
+    steps:
+      - checkout
+      - run: mkdir -p ./dist
+      - attach_workspace:
+          at: ./dist
+      - restore_cache:
+          key: npm-{{ arch }}-{{ .Branch }}-{{ checksum "package-lock.json" }}
+      - restore_cache:
+          key: npm-{{ arch }}-{{ .Branch }}-{{ checksum "src/package-lock.json" }}
+      - update_image:
+          apt_opts: "--no-install-recommends jq icnsutils graphicsmagick tzdata"
+      - build
+      - save_cache:
+          key: npm-{{ arch }}-{{ .Branch }}-{{ checksum "package-lock.json" }}
+          paths:
+            - "node_modules"
+            - "~/.cache/electron"
+            - "~/.cache/electron-builder"
+      - save_cache:
+          key: npm-{{ arch }}-{{ .Branch }}-{{ checksum "src/package-lock.json" }}
+          paths:
+            - "src/node_modules"
+
+  build-win-no-installer:
+    executor: wine-mono
+    steps:
+      - checkout
+      - run: mkdir -p ./dist
+      - attach_workspace:
+          at: ./dist
+      - restore_cache:
+          key: npm-{{ arch }}-{{ .Branch }}-{{ checksum "package-lock.json" }}
+      - restore_cache:
+          key: npm-{{ arch }}-{{ .Branch }}-{{ checksum "src/package-lock.json" }}
+      - update_image:
+          apt_opts: "--no-install-recommends jq icnsutils graphicsmagick tzdata"
+      - build:
+          os: windows
+          path: ./dist/win
+          subpath: ./win/
+      - save_cache:
+          key: npm-{{ arch }}-{{ .Branch }}-{{ checksum "package-lock.json" }}
+          paths:
+            - "node_modules"
+            - "~/.cache/electron"
+            - "~/.cache/electron-builder"
+      - save_cache:
+          key: npm-{{ arch }}-{{ .Branch }}-{{ checksum "src/package-lock.json" }}
+          paths:
+            - "src/node_modules"
+
+  build-mac-no-dmg:
+    executor: wine-mono
+    steps:
+      - checkout
+      - run: mkdir -p ./dist
+      - attach_workspace:
+          at: ./dist
+      - restore_cache:
+          key: npm-{{ arch }}-{{ .Branch }}-{{ checksum "package-lock.json" }}
+      - restore_cache:
+          key: npm-{{ arch }}-{{ .Branch }}-{{ checksum "src/package-lock.json" }}
+      - update_image:
+          apt_opts: "--no-install-recommends jq icnsutils graphicsmagick tzdata"
+      - run: jq '.mac.target=["zip"]' electron-builder.json | jq '.mac.gatekeeperAssess=false' > /tmp/electron-builder.json && cp /tmp/electron-builder.json .
+
+      - build:
+          os: mac
+          path: ./dist/macos
+          subpath: ./macos/
+      - save_cache:
+          key: npm-{{ arch }}-{{ .Branch }}-{{ checksum "package-lock.json" }}
+          paths:
+            - "node_modules"
+            - "~/.cache/electron"
+            - "~/.cache/electron-builder"
+      - save_cache:
+          key: npm-{{ arch }}-{{ .Branch }}-{{ checksum "src/package-lock.json" }}
+          paths:
+            - "src/node_modules"
+
+  msi_installer:
+    executor: win/vs2019
+
+    steps:
+      - checkout
+      - run: mkdir -p ./dist/
+      - attach_workspace:
+          at: ./dist
+      - win_make:
+          operation: optimize
+      - win_make:
+          operation: "install-deps"
+      - win_make:
+          operation: "build"
+      - run: mkdir -p ./dist/win-release
+      - run: cp -r release/*.zip ./dist/win-release
+      - run: cp -r release/*.msi ./dist/win-release
+      - run: cp -r release/*.exe ./dist/win-release
+
+      - persist_to_workspace:
+          root: ./dist/
+          paths:
+            - "./win-release/"
+
+  mac_installer:
+    executor: mac
+
+    steps:
+      - checkout
+      - run: mkdir -p ./dist
+      - attach_workspace:
+          at: ./dist
+      - run:
+          name: Installing npm dependencies
+          command: npm install
+      - build:
+          os: mac
+          path: ./dist/macos-release
+          subpath: ./macos-release/
+
+  store_artifacts:
+    executor: wine-chrome
+    steps:
+      - attach_workspace:
+          at: ./dist
+      - store_artifacts:
+          path: ./dist
+          destination: packages
+
+  upload_to_s3:
+    executor: aws
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ./dist
+      - run:
+          name: "Don't upload if it's not on a tag"
+          command: |
+            if [ -z `git tag -l --points-at master` ]; then
+              circleci-agent step halt
+            fi  
+      - run:
+          name: "Setup files for aws-s3"
+          command: |
+            mkdir -p ./aws-s3-dist
+            cp ./dist/{macos-release,win-release,linux}/* ./aws-s3-dist
+      - aws-s3/copy:
+          from: ./aws-s3-dist/
+          to: s3://releases.mattermost.com/desktop/$(jq -r .version package.json)/
+          arguments: --acl public-read --cache-control "no-cache" --recursive
+
+  upload_to_github:
+    executor: github
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ./dist
+      - run:
+          name: "Don't upload if it's not on a tag"
+          command: |
+            if [ -z `git tag -l --points-at master` ]; then
+              circleci-agent step halt
+            fi  
+      - run:
+          name: "Setup files for ghr"
+          command: |
+            mkdir -p ./ghr-dist
+            cp ./dist/{macos-release,win-release,linux}/* ./ghr-dist
+      - run:
+          name: "Publish Release on GitHub"
+          command: |
+            go get github.com/tcnksm/ghr
+            VERSION=$(jq -r .version package.json)
+            RELEASE_TITLE="v${VERSION} ($(date -u "+%Y-%m-%d"))"
+            ghr \
+              -t ${GITHUB_TOKEN} \
+              -u ${CIRCLE_PROJECT_USERNAME} \
+              -draft \
+              --body="$(./scripts/generate_release_markdown.sh $VERSION)" \
+              --name="${RELEASE_TITLE}" $( [[ $VERSION =~ "-rc" ]] && printf %s "-prerelease") \
+              -r ${CIRCLE_PROJECT_REPONAME} \
+              -c ${CIRCLE_SHA1} \
+              -delete \
+              v${VERSION} ./ghr-dist
+
+  begin-notification:
+    executor: wine-chrome
+    steps:
+      - checkout
+      - update_image:
+          apt_opts: "--no-install-recommends jq"
+      - notify:
+          message: "Release process for the desktop app has started, it should take about 30 minutes to complete."
+  
+  end-notification:
+    executor: wine-chrome
+    steps:
+      - checkout
+      - update_image:
+          apt_opts: "--no-install-recommends jq"
+      - notify:
+          message: "Release process for the desktop app ended, the new release can be found on [GitHub](https://github.com/mattermost/desktop/releases)."
+
+
+workflows:
+  version: 2
+  build_and_test:
+    jobs:
+      - check
+      - begin-notification:
+          context: desktop-notify
+          filters:
+            branches:
+              only:
+                # only for release and release candidates
+                # release-XX.YY.ZZ
+                # release-XX.YY.ZZ-rc-something
+                - /^release-\d+(\.\d+){1,2}(-rc.*)?/
+      - build-linux:
+          requires:
+            - check
+      - check-deps:
+          context: sast-webhook
+          requires:
+            - build-linux
+
+      - build-win-no-installer:
+          requires:
+            - check
+          filters:
+            branches:
+              ignore:
+                - /^release-\d+(\.\d+){1,2}(-rc.*)?/
+
+      - build-mac-no-dmg:
+          requires:
+            - check
+          filters:
+            branches:
+              ignore:
+                - /^release-\d+(\.\d+){1,2}(-rc.*)?/
+
+      - msi_installer:
+          requires:
+            - check
+          context: windows-codesign
+          filters:
+            branches:
+              only:
+                # only for release and release candidates
+                # release-XX.YY.ZZ
+                # release-XX.YY.ZZ-rc-something
+                - /^release-\d+(\.\d+){1,2}(-rc.*)?/
+
+      - mac_installer:
+          requires:
+            - check
+          context: codesign-certificates
+          filters:
+            branches:
+              only:
+                - /^release-\d+(\.\d+){1,2}(-rc.*)?/
+
+      - store_artifacts:
+          # for master/PR builds
+          requires:
+            - build-linux
+            - build-win-no-installer
+            - build-mac-no-dmg
+          filters:
+            branches:
+              ignore:
+                - /^release-\d+(\.\d+){1,2}(-rc.*)?/
+
+      - upload_to_s3:
+          # for release builds
+          requires:
+            - msi_installer
+            - mac_installer
+            - build-linux
+          context: mattermost-release-s3
+          filters:
+            branches:
+              only:
+                - /^release-\d+(\.\d+){1,2}(-rc.*)?/
+
+      - upload_to_github:
+          requires:
+            - upload_to_s3
+          context: matterbuild-github-token
+          filters:
+            branches:
+              only:
+                - /^release-\d+(\.\d+){1,2}(-rc.*)?/
+      - end-notification:
+          requires:
+            - upload_to_github
+          context: desktop-notify
+          filters:
+            branches:
+              only:
+                # only for release and release candidates
+                # release-XX.YY.ZZ
+                # release-XX.YY.ZZ-rc-something
+                - /^release-\d+(\.\d+){1,2}(-rc.*)?/
