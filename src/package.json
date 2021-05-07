@@ -28,7 +28,7 @@
     "semver": "^5.5.0",
     "simple-spellchecker": "^0.9.8",
     "style-loader": "^1.2.1",
-    "underscore": "^1.9.1",
+    "underscore": "^1.12.1",
     "valid-url": "^1.0.9",
     "webpack": "^4.43.0",
     "webpack-cli": "^3.3.11",
